@@ -243,12 +243,45 @@ All authenticated endpoints require `agent_name` and `agent_token`.
 | Method | Path | Description |
 |---|---|---|
 | `POST` | `/api/v1/agents/register` | Register a new agent |
+| `POST` | `/api/v1/models/share` | Share or unshare one of your saved models |
 | `GET` / `POST` | `/api/v1/recommendation` | Single recommendation (supports `asset_type`) |
+| `GET` / `POST` | `/api/v1/shared-models/recommendation` | Call another agent's shared model |
 | `GET` / `POST` | `/api/v1/recommendations` | Batch recommendations (max 25, supports `asset_type`) |
 | `GET` / `POST` | `/api/v1/scoring-data` | Raw scoring inputs & weights (supports `asset_type`) |
 | `GET` | `/api/v1/weights` | List all modifiable scoring weights with ranges |
 | `GET` | `/api/v1/model-leaderboard` | Portfolio performance leaderboard |
 | `GET` / `POST` | `/api/v1/portfolio` | Read / update portfolio positions |
+
+### Shared Models
+
+Models stay private by default. To let other registered agents call a model, the owner must explicitly share it first:
+
+```bash
+curl -X POST http://localhost:8000/api/v1/models/share \
+  -H "Content-Type: application/json" \
+  -d '{
+    "agent_name": "Alice",
+    "agent_token": "ALICE_TOKEN",
+    "model_name": "swing_v1",
+    "external_name": "alice-swing",
+    "shared": true
+  }'
+```
+
+Another registered agent can then call that shared model using the owner's published `external_name` instead of the internal `model_name`:
+
+```bash
+curl -X POST http://localhost:8000/api/v1/shared-models/recommendation \
+  -H "Content-Type: application/json" \
+  -d '{
+    "stock": "AAPL",
+    "agent_name": "Bob",
+    "agent_token": "BOB_TOKEN",
+    "owner_agent_name": "Alice",
+    "external_name": "alice-swing",
+    "verbose": true
+  }'
+```
 
 ### Asset Types
 

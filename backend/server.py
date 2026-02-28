@@ -218,6 +218,58 @@ def _parse_weights_payload(raw_weights):
     return None
 
 
+def _run_shared_analysis(stock, weights, verbose, model_name, asset_type):
+    stock = (stock or "").strip()
+    if not stock:
+        return {"status_code": 400, "error": "Stock input is required"}
+    if len(stock) > 120:
+        return {"status_code": 400, "error": "Stock input is too long"}
+
+    at = (asset_type or "stock").lower()
+    if at not in _VALID_ASSET_TYPES:
+        at = "stock"
+
+    resolved_symbol = _resolve_symbol_from_input(stock, asset_type=at)
+    if not resolved_symbol:
+        return {
+            "status_code": 400,
+            "error": (
+                "Could not resolve input to a ticker. "
+                "Provide a valid ticker (for example, AAPL, BTC-USD, ES=F) or a company name."
+            ),
+        }
+
+    try:
+        analysis = generate_full_analysis(resolved_symbol, weights=weights, asset_type=at)
+    except Exception:
+        return {"status_code": 502, "error": f"Failed to generate recommendation for {resolved_symbol}"}
+
+    if analysis.get("ai_recommendation") is None:
+        return {"status_code": 502, "error": f"Recommendation unavailable for {resolved_symbol}"}
+
+    action = analysis["ai_recommendation"].get("action")
+    if not action:
+        return {"status_code": 502, "error": f"Recommendation action unavailable for {resolved_symbol}"}
+
+    if not verbose:
+        return {"recommendation": action, "model_name": model_name}
+
+    return {
+        "input": stock,
+        "resolved_symbol": resolved_symbol,
+        "asset_type": at,
+        "company": analysis.get("company"),
+        "stock_analysis": analysis.get("stock_analysis"),
+        "sentiment_analysis": analysis.get("sentiment_analysis"),
+        "social_analysis": analysis.get("social_analysis"),
+        "media_analysis": analysis.get("media_analysis"),
+        "ai_recommendation": analysis.get("ai_recommendation"),
+        "scoring_weights": analysis.get("scoring_weights"),
+        "model_name": model_name,
+        "generated_at": analysis.get("generated_at"),
+    }
+
+
 class ConstructionHandler(http.server.SimpleHTTPRequestHandler):
     SEC_TICKERS_CACHE = None
     SEC_TICKERS_CACHE_LOCK = threading.Lock()
@@ -229,6 +281,7 @@ class ConstructionHandler(http.server.SimpleHTTPRequestHandler):
     STOCK_QUERY_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9\.\-]{0,9}$")
     AGENT_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_\-\.]{0,63}$")
     MODEL_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_\-\.]{0,63}$")
+    EXTERNAL_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_\-\.]{0,63}$")
     DEFAULT_MODEL_NAME = "default"
 
     def end_headers(self):
@@ -249,6 +302,8 @@ class ConstructionHandler(http.server.SimpleHTTPRequestHandler):
             self.serve_health_check()
         elif parsed_path.path == '/api/v1/recommendation':
             self.serve_api_recommendation_get(query)
+        elif parsed_path.path == '/api/v1/shared-models/recommendation':
+            self.serve_api_shared_model_recommendation_get(query)
         elif parsed_path.path == '/api/v1/weights':
             self.serve_api_weights()
         elif parsed_path.path == '/api/v1/model-leaderboard':
@@ -286,8 +341,14 @@ class ConstructionHandler(http.server.SimpleHTTPRequestHandler):
         if parsed_path.path == '/api/v1/agents/register':
             self.serve_api_register_agent()
             return
+        if parsed_path.path == '/api/v1/models/share':
+            self.serve_api_share_model()
+            return
         if parsed_path.path == '/api/v1/recommendation':
             self.serve_api_recommendation_post()
+            return
+        if parsed_path.path == '/api/v1/shared-models/recommendation':
+            self.serve_api_shared_model_recommendation_post()
             return
         if parsed_path.path == '/api/v1/scoring-data':
             self.serve_api_scoring_data_post()
@@ -457,6 +518,16 @@ class ConstructionHandler(http.server.SimpleHTTPRequestHandler):
             return None
         return model_name
 
+    def _normalize_external_name(self, raw_external_name):
+        external_name = (raw_external_name or "").strip()
+        if not external_name:
+            return None
+        if len(external_name) > 64:
+            return None
+        if not self.EXTERNAL_NAME_PATTERN.fullmatch(external_name):
+            return None
+        return external_name
+
     def _normalize_agent_weights_record(self, record, fallback_agent_name):
         if not isinstance(record, dict):
             return None
@@ -480,6 +551,8 @@ class ConstructionHandler(http.server.SimpleHTTPRequestHandler):
                 models[model_name] = {
                     "weights": weights,
                     "updated_at": model_data.get("updated_at"),
+                    "shared": bool(model_data.get("shared", False)),
+                    "external_name": self._normalize_external_name(model_data.get("external_name")),
                 }
 
         legacy_weights = record.get("weights")
@@ -487,6 +560,8 @@ class ConstructionHandler(http.server.SimpleHTTPRequestHandler):
             models[default_model] = {
                 "weights": legacy_weights,
                 "updated_at": record.get("updated_at"),
+                "shared": bool(record.get("shared", False)),
+                "external_name": self._normalize_external_name(record.get("external_name")),
             }
 
         if default_model not in models:
@@ -546,6 +621,113 @@ class ConstructionHandler(http.server.SimpleHTTPRequestHandler):
                 return None, active_model
             return weights, active_model
 
+    def _get_model_entry(self, agent_name, model_name=None):
+        with ConstructionHandler.WEIGHTS_DB_LOCK:
+            try:
+                agents = self._load_weights_db()
+            except ValueError:
+                return None, (model_name or self.DEFAULT_MODEL_NAME)
+
+            cleaned_name = (agent_name or "").strip()
+            record = agents.get(cleaned_name)
+            normalized = self._normalize_agent_weights_record(record, cleaned_name)
+            if not normalized:
+                return None, (model_name or self.DEFAULT_MODEL_NAME)
+
+            active_model = model_name or normalized.get("default_model", self.DEFAULT_MODEL_NAME)
+            model_entry = (normalized.get("models") or {}).get(active_model)
+            if not isinstance(model_entry, dict):
+                return None, active_model
+            return model_entry, active_model
+
+    def _find_model_by_external_name(self, agent_name, external_name):
+        with ConstructionHandler.WEIGHTS_DB_LOCK:
+            try:
+                agents = self._load_weights_db()
+            except ValueError:
+                return None, self.DEFAULT_MODEL_NAME
+
+            cleaned_name = (agent_name or "").strip()
+            cleaned_external = self._normalize_external_name(external_name)
+            record = agents.get(cleaned_name)
+            normalized = self._normalize_agent_weights_record(record, cleaned_name)
+            if not normalized or not cleaned_external:
+                return None, self.DEFAULT_MODEL_NAME
+
+            for candidate_model_name, model_entry in (normalized.get("models") or {}).items():
+                if not isinstance(model_entry, dict):
+                    continue
+                if str(model_entry.get("external_name") or "") == cleaned_external:
+                    return model_entry, candidate_model_name
+            return None, self.DEFAULT_MODEL_NAME
+
+    def _get_shared_model_weights(self, owner_agent_name, model_name=None, external_name=None):
+        if external_name:
+            model_entry, active_model = self._find_model_by_external_name(owner_agent_name, external_name)
+        else:
+            model_entry, active_model = self._get_model_entry(owner_agent_name, model_name=model_name)
+        if not model_entry:
+            return None, active_model, "not_found"
+        if not bool(model_entry.get("shared", False)):
+            return None, active_model, "not_shared"
+        weights = model_entry.get("weights")
+        if not isinstance(weights, dict):
+            return None, active_model, "invalid_weights"
+        return weights, active_model, self._normalize_external_name(model_entry.get("external_name")), None
+
+    def _set_model_shared(self, agent_name, agent_token, shared, model_name=None, external_name=None):
+        cleaned_name = (agent_name or "").strip()
+        cleaned_token = (agent_token or "").strip()
+        active_model = model_name or self._get_default_model_name(cleaned_name, cleaned_token)
+
+        with ConstructionHandler.WEIGHTS_DB_LOCK:
+            try:
+                agents = self._load_weights_db()
+            except ValueError:
+                self.send_json(500, {"error": "Weights database unavailable"})
+                return None
+
+            existing = self._normalize_agent_weights_record(agents.get(cleaned_name), cleaned_name)
+            if not existing:
+                self.send_json(404, {"error": "No saved models found for agent."})
+                return None
+
+            expected_token = str(existing.get("agent_token", ""))
+            if not expected_token or not secrets.compare_digest(expected_token, cleaned_token):
+                self.send_json(401, {"error": "Invalid agent token"})
+                return None
+
+            model_entry = (existing.get("models") or {}).get(active_model)
+            if not isinstance(model_entry, dict):
+                self.send_json(404, {"error": f"Model '{active_model}' not found for agent."})
+                return None
+
+            normalized_external = self._normalize_external_name(external_name) if external_name is not None else None
+            if external_name is not None and normalized_external is None:
+                self.send_json(400, {"error": "Invalid external_name format"})
+                return None
+            for candidate_model_name, candidate_entry in (existing.get("models") or {}).items():
+                if candidate_model_name == active_model or not isinstance(candidate_entry, dict):
+                    continue
+                if normalized_external and str(candidate_entry.get("external_name") or "") == normalized_external:
+                    self.send_json(409, {"error": f"external_name '{normalized_external}' is already in use for this agent."})
+                    return None
+
+            model_entry["shared"] = bool(shared)
+            model_entry["external_name"] = normalized_external
+            model_entry["updated_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            existing["models"][active_model] = model_entry
+            agents[cleaned_name] = existing
+            self._save_weights_db(agents)
+
+        return {
+            "agent_name": cleaned_name,
+            "model_name": active_model,
+            "shared": bool(shared),
+            "external_name": normalized_external,
+            "updated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        }
+
     def _save_agent_weights(self, agent_name, agent_token, weights, model_name=None):
         if not isinstance(weights, dict):
             return
@@ -572,9 +754,16 @@ class ConstructionHandler(http.server.SimpleHTTPRequestHandler):
             existing["agent_token"] = cleaned_token
             existing["default_model"] = existing.get("default_model", self.DEFAULT_MODEL_NAME) or self.DEFAULT_MODEL_NAME
             existing.setdefault("models", {})
+            prior_model = existing["models"].get(active_model)
             existing["models"][active_model] = {
                 "weights": weights,
                 "updated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                "shared": bool(prior_model.get("shared", False)) if isinstance(prior_model, dict) else False,
+                "external_name": (
+                    self._normalize_external_name(prior_model.get("external_name"))
+                    if isinstance(prior_model, dict)
+                    else None
+                ),
             }
             agents[cleaned_name] = existing
             self._save_weights_db(agents)
@@ -722,6 +911,37 @@ class ConstructionHandler(http.server.SimpleHTTPRequestHandler):
         if payload is None:
             return
         self._register_agent(payload.get("name", ""))
+
+    def serve_api_share_model(self):
+        payload = self._read_json_body()
+        if payload is None:
+            return
+
+        agent_name = payload.get("agent_name", "")
+        agent_token = payload.get("agent_token", "")
+        if not self._validate_agent(agent_name, agent_token):
+            return
+
+        raw_model_name = payload.get("model_name", "")
+        model_name = self._normalize_model_name(raw_model_name) if raw_model_name else None
+        if raw_model_name and model_name is None:
+            self.send_json(400, {"error": "Invalid model_name format"})
+            return
+        external_name = payload.get("external_name")
+        if external_name is not None and self._normalize_external_name(external_name) is None:
+            self.send_json(400, {"error": "Invalid external_name format"})
+            return
+
+        result = self._set_model_shared(
+            agent_name,
+            agent_token,
+            shared=bool(payload.get("shared", True)),
+            model_name=model_name,
+            external_name=external_name,
+        )
+        if result is None:
+            return
+        self.send_json(200, result)
 
     def serve_api_weights(self):
         weights = []
@@ -1119,6 +1339,115 @@ class ConstructionHandler(http.server.SimpleHTTPRequestHandler):
             model_name=active_model,
             asset_type=asset_type,
         )
+
+    def serve_api_shared_model_recommendation_get(self, query):
+        stock = query.get("stock", [""])[0]
+        asset_type = query.get("asset_type", ["stock"])[0]
+        agent_name = query.get("agent_name", [""])[0]
+        agent_token = query.get("agent_token", [""])[0]
+        owner_agent_name = query.get("owner_agent_name", [""])[0]
+        raw_model_name = query.get("model_name", [""])[0]
+        model_name = self._normalize_model_name(raw_model_name) if raw_model_name else None
+        if raw_model_name and model_name is None:
+            self.send_json(400, {"error": "Invalid model_name format"})
+            return
+        raw_external_name = query.get("external_name", [""])[0]
+        external_name = self._normalize_external_name(raw_external_name) if raw_external_name else None
+        if raw_external_name and external_name is None:
+            self.send_json(400, {"error": "Invalid external_name format"})
+            return
+        verbose = _parse_bool(query.get("verbose", [""])[0], default=False)
+        if "verborse" in query:
+            verbose = _parse_bool(query.get("verborse", [""])[0], default=verbose)
+
+        if not self._validate_agent(agent_name, agent_token):
+            return
+
+        weights, active_model, resolved_external_name, error = self._get_shared_model_weights(
+            owner_agent_name,
+            model_name=model_name,
+            external_name=external_name,
+        )
+        if error == "not_found":
+            self.send_json(404, {"error": f"Model '{model_name or self.DEFAULT_MODEL_NAME}' not found for agent."})
+            return
+        if error == "not_shared":
+            self.send_json(403, {"error": "Requested model is not shared by its owner."})
+            return
+        if error == "invalid_weights":
+            self.send_json(500, {"error": "Shared model weights are unavailable"})
+            return
+
+        response = _run_shared_analysis(
+            stock,
+            weights,
+            verbose,
+            active_model,
+            asset_type,
+        )
+        if "error" in response:
+            self.send_json(response["status_code"], {"error": response["error"]})
+            return
+        response["model_owner"] = owner_agent_name
+        response["called_by"] = agent_name
+        response["external_name"] = resolved_external_name
+        self.send_json(200, response)
+
+    def serve_api_shared_model_recommendation_post(self):
+        payload = self._read_json_body()
+        if payload is None:
+            return
+
+        agent_name = payload.get("agent_name", "")
+        agent_token = payload.get("agent_token", "")
+        if not self._validate_agent(agent_name, agent_token):
+            return
+
+        raw_model_name = payload.get("model_name", "")
+        model_name = self._normalize_model_name(raw_model_name) if raw_model_name else None
+        if raw_model_name and model_name is None:
+            self.send_json(400, {"error": "Invalid model_name format"})
+            return
+        external_name = payload.get("external_name")
+        if external_name is not None and self._normalize_external_name(external_name) is None:
+            self.send_json(400, {"error": "Invalid external_name format"})
+            return
+
+        verbose = _parse_bool(payload.get("verbose"), default=False)
+        if "verborse" in payload:
+            verbose = _parse_bool(payload.get("verborse"), default=verbose)
+
+        owner_agent_name = payload.get("owner_agent_name", "")
+        asset_type = payload.get("asset_type", "stock")
+        weights, active_model, resolved_external_name, error = self._get_shared_model_weights(
+            owner_agent_name,
+            model_name=model_name,
+            external_name=external_name,
+        )
+        if error == "not_found":
+            self.send_json(404, {"error": f"Model '{model_name or self.DEFAULT_MODEL_NAME}' not found for agent."})
+            return
+        if error == "not_shared":
+            self.send_json(403, {"error": "Requested model is not shared by its owner."})
+            return
+        if error == "invalid_weights":
+            self.send_json(500, {"error": "Shared model weights are unavailable"})
+            return
+
+        response = _run_shared_analysis(
+            payload.get("stock", ""),
+            weights,
+            verbose,
+            active_model,
+            asset_type,
+        )
+        if "error" in response:
+            self.send_json(response["status_code"], {"error": response["error"]})
+            return
+        response["model_owner"] = owner_agent_name
+        response["called_by"] = agent_name
+        response["external_name"] = resolved_external_name
+        self.send_json(200, response)
 
     def _build_scoring_data_response(
         self,

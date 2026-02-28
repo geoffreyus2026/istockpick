@@ -17,6 +17,7 @@ _MAX_AGENT_NAME_LEN = 64
 _MAX_AGENT_TOKEN_LEN = 256
 _AGENT_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_\-\.]{0,63}$")
 _MODEL_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_\-\.]{0,63}$")
+_EXTERNAL_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_\-\.]{0,63}$")
 _DEFAULT_MODEL_NAME = "default"
 
 
@@ -94,6 +95,50 @@ class ScoringDataRequest(BaseModel):
     )
 
 
+class ModelShareRequest(BaseModel):
+    agent_name: str = Field(..., description="Registered agent name")
+    agent_token: str = Field(..., description="Registered agent token")
+    model_name: Optional[str] = Field(
+        default=None,
+        description="Optional model name. Defaults to the caller's default model.",
+    )
+    external_name: Optional[str] = Field(
+        default=None,
+        description="Optional public-facing identifier other developers can use for this shared model.",
+    )
+    shared: bool = Field(
+        default=True,
+        description="Whether the model should be callable by other registered agents.",
+    )
+
+
+class SharedModelRecommendationRequest(BaseModel):
+    stock: str = Field(..., description="Ticker symbol or company name")
+    agent_name: str = Field(..., description="Registered caller agent name")
+    agent_token: str = Field(..., description="Registered caller agent token")
+    owner_agent_name: str = Field(..., description="Owner of the shared model")
+    model_name: Optional[str] = Field(
+        default=None,
+        description="Optional internal model name. Owners can keep using this; external callers should prefer external_name.",
+    )
+    external_name: Optional[str] = Field(
+        default=None,
+        description="Optional public-facing model identifier published by the owner.",
+    )
+    asset_type: str = Field(
+        default="stock",
+        description="Asset type: stock, crypto, option, or future",
+    )
+    verbose: bool = Field(
+        default=False,
+        description="If true, return detailed recommendation sections",
+    )
+    verborse: Optional[bool] = Field(
+        default=None,
+        description="Deprecated alias for verbose",
+    )
+
+
 class ScoringWeights(BaseModel):
     base_score: Optional[float] = Field(default=None, ge=0, le=100)
     trend_bullish: Optional[float] = Field(default=None, ge=0, le=100)
@@ -111,7 +156,13 @@ class ScoringWeights(BaseModel):
 
 
 def _rebuild_forward_refs() -> None:
-    for model in (RecommendationRequest, BatchRecommendationRequest, ScoringDataRequest):
+    for model in (
+        RecommendationRequest,
+        BatchRecommendationRequest,
+        ScoringDataRequest,
+        ModelShareRequest,
+        SharedModelRecommendationRequest,
+    ):
         if hasattr(model, "model_rebuild"):
             model.model_rebuild()
         elif hasattr(model, "update_forward_refs"):
@@ -176,6 +227,17 @@ def _normalize_model_name(model_name: Optional[str]) -> Optional[str]:
         return None
     if len(cleaned) > 64 or not _MODEL_NAME_PATTERN.fullmatch(cleaned):
         raise HTTPException(status_code=400, detail="Invalid model_name format")
+    return cleaned
+
+
+def _normalize_external_name(external_name: Optional[str]) -> Optional[str]:
+    if external_name is None:
+        return None
+    cleaned = external_name.strip()
+    if not cleaned:
+        return None
+    if len(cleaned) > 64 or not _EXTERNAL_NAME_PATTERN.fullmatch(cleaned):
+        raise HTTPException(status_code=400, detail="Invalid external_name format")
     return cleaned
 
 
@@ -259,6 +321,97 @@ def create_app() -> FastAPI:
     @app.post("/api/v1/agents/register")
     def register_agent(request: AgentRegistrationRequest) -> dict:
         return _register_agent(request.name)
+
+    @app.post("/api/v1/models/share")
+    def share_model(request: ModelShareRequest) -> dict:
+        normalized_model = _normalize_model_name(request.model_name)
+        normalized_external = _normalize_external_name(request.external_name)
+        result = _set_model_shared(
+            request.agent_name,
+            request.agent_token,
+            shared=request.shared,
+            model_name=normalized_model,
+            external_name=normalized_external,
+        )
+        result["updated_at"] = datetime.now(timezone.utc).isoformat()
+        return result
+
+    @app.get("/api/v1/shared-models/recommendation")
+    def get_shared_model_recommendation(
+        stock: str = Query(..., description="Ticker symbol or company name"),
+        agent_name: str = Query(..., description="Registered caller agent name"),
+        agent_token: str = Query(..., description="Registered caller agent token"),
+        owner_agent_name: str = Query(..., description="Owner of the shared model"),
+        asset_type: str = Query(
+            default="stock",
+            description="Asset type: stock, crypto, option, or future",
+        ),
+        model_name: Optional[str] = Query(
+            default=None,
+            description="Optional internal model name. Owners can keep using this; external callers should prefer external_name.",
+        ),
+        external_name: Optional[str] = Query(
+            default=None,
+            description="Optional public-facing model identifier published by the owner.",
+        ),
+        verbose: bool = Query(
+            default=False,
+            description="If true, return detailed recommendation sections",
+        ),
+        verborse: Optional[bool] = Query(
+            default=None,
+            description="Deprecated alias for verbose",
+        ),
+    ) -> dict:
+        _validate_agent(agent_name, agent_token)
+        normalized_model = _normalize_model_name(model_name)
+        normalized_external = _normalize_external_name(external_name)
+        verbose_flag = _resolve_verbose_flag(verbose=verbose, verborse=verborse)
+        shared_weights, active_model, resolved_external_name = _get_shared_model_weights(
+            owner_agent_name,
+            model_name=normalized_model,
+            external_name=normalized_external,
+        )
+        response = _build_recommendation_response(
+            stock,
+            shared_weights,
+            verbose=verbose_flag,
+            model_name=active_model,
+            asset_type=asset_type,
+        )
+        return _annotate_shared_response(
+            response,
+            owner_agent_name,
+            agent_name,
+            active_model,
+            resolved_external_name,
+        )
+
+    @app.post("/api/v1/shared-models/recommendation")
+    def post_shared_model_recommendation(request: SharedModelRecommendationRequest) -> dict:
+        _validate_agent(request.agent_name, request.agent_token)
+        normalized_model = _normalize_model_name(request.model_name)
+        normalized_external = _normalize_external_name(request.external_name)
+        verbose_flag = _resolve_verbose_flag(verbose=request.verbose, verborse=request.verborse)
+        shared_weights, active_model, resolved_external_name = _get_shared_model_weights(
+            request.owner_agent_name,
+            model_name=normalized_model,
+            external_name=normalized_external,
+        )
+        response = _build_recommendation_response(
+            request.stock,
+            shared_weights,
+            verbose=verbose_flag,
+            model_name=active_model,
+            asset_type=request.asset_type,
+        )
+        return _annotate_shared_response(
+            response,
+            request.owner_agent_name,
+            request.agent_name,
+            active_model,
+            resolved_external_name,
+        )
 
     @app.get("/api/v1/recommendation")
     def get_recommendation(
@@ -722,6 +875,8 @@ def _normalize_agent_weights_record(record: object, fallback_agent_name: str) ->
             models[model_name] = {
                 "weights": sanitized,
                 "updated_at": model_data.get("updated_at"),
+                "shared": bool(model_data.get("shared", False)),
+                "external_name": _normalize_external_name(model_data.get("external_name")),
             }
 
     # Backward compatibility for legacy one-model schema.
@@ -730,6 +885,8 @@ def _normalize_agent_weights_record(record: object, fallback_agent_name: str) ->
         models[default_model] = {
             "weights": legacy_weights,
             "updated_at": record.get("updated_at"),
+            "shared": bool(record.get("shared", False)),
+            "external_name": _normalize_external_name(record.get("external_name")),
         }
 
     if default_model not in models:
@@ -796,6 +953,120 @@ def _get_saved_agent_weights(
     return weights, active_model
 
 
+def _get_model_entry(agent_name: str, model_name: Optional[str] = None) -> tuple[Optional[dict], str]:
+    cleaned_name = agent_name.strip()
+    active_model = model_name or _DEFAULT_MODEL_NAME
+    if not cleaned_name:
+        return None, active_model
+
+    with _DB_LOCK:
+        agents = _load_weights_agents()
+        record = agents.get(cleaned_name)
+
+    normalized = _normalize_agent_weights_record(record, cleaned_name)
+    if not normalized:
+        return None, active_model
+
+    active_model = model_name or str(normalized.get("default_model") or _DEFAULT_MODEL_NAME)
+    model_entry = (normalized.get("models") or {}).get(active_model)
+    if not isinstance(model_entry, dict):
+        return None, active_model
+    return model_entry, active_model
+
+
+def _find_model_by_external_name(agent_name: str, external_name: str) -> tuple[Optional[dict], str]:
+    cleaned_name = agent_name.strip()
+    cleaned_external = _normalize_external_name(external_name)
+    if not cleaned_name or not cleaned_external:
+        return None, _DEFAULT_MODEL_NAME
+
+    with _DB_LOCK:
+        agents = _load_weights_agents()
+        record = agents.get(cleaned_name)
+
+    normalized = _normalize_agent_weights_record(record, cleaned_name)
+    if not normalized:
+        return None, _DEFAULT_MODEL_NAME
+
+    for candidate_model_name, model_entry in (normalized.get("models") or {}).items():
+        if not isinstance(model_entry, dict):
+            continue
+        if str(model_entry.get("external_name") or "") == cleaned_external:
+            return model_entry, candidate_model_name
+    return None, _DEFAULT_MODEL_NAME
+
+
+def _set_model_shared(
+    agent_name: str,
+    agent_token: str,
+    shared: bool,
+    model_name: Optional[str] = None,
+    external_name: Optional[str] = None,
+) -> dict:
+    _validate_agent(agent_name, agent_token)
+    active_model = model_name or _get_default_model_name(agent_name, agent_token)
+
+    with _DB_LOCK:
+        agents = _load_weights_agents()
+        cleaned_name = agent_name.strip()
+        cleaned_token = agent_token.strip()
+        existing = _normalize_agent_weights_record(agents.get(cleaned_name), cleaned_name)
+        if not existing:
+            raise HTTPException(status_code=404, detail="No saved models found for agent.")
+
+        expected_token = str(existing.get("agent_token", ""))
+        if not expected_token or not secrets.compare_digest(expected_token, cleaned_token):
+            raise HTTPException(status_code=401, detail="Invalid agent token")
+
+        model_entry = (existing.get("models") or {}).get(active_model)
+        if not isinstance(model_entry, dict):
+            raise HTTPException(status_code=404, detail=f"Model '{active_model}' not found for agent.")
+
+        normalized_external_name = _normalize_external_name(external_name)
+        for candidate_model_name, candidate_entry in (existing.get("models") or {}).items():
+            if candidate_model_name == active_model or not isinstance(candidate_entry, dict):
+                continue
+            if normalized_external_name and str(candidate_entry.get("external_name") or "") == normalized_external_name:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"external_name '{normalized_external_name}' is already in use for this agent.",
+                )
+
+        model_entry["shared"] = bool(shared)
+        model_entry["external_name"] = normalized_external_name
+        model_entry["updated_at"] = datetime.now(timezone.utc).isoformat()
+        existing["models"][active_model] = model_entry
+        agents[cleaned_name] = existing
+        _save_weights_agents(agents)
+
+    return {
+        "agent_name": cleaned_name,
+        "model_name": active_model,
+        "shared": bool(shared),
+        "external_name": normalized_external_name,
+    }
+
+
+def _get_shared_model_weights(
+    owner_agent_name: str,
+    model_name: Optional[str] = None,
+    external_name: Optional[str] = None,
+) -> tuple[dict, str, Optional[str]]:
+    normalized_external = _normalize_external_name(external_name)
+    if normalized_external:
+        model_entry, active_model = _find_model_by_external_name(owner_agent_name, normalized_external)
+    else:
+        model_entry, active_model = _get_model_entry(owner_agent_name, model_name=model_name)
+    if not model_entry:
+        raise HTTPException(status_code=404, detail=f"Model '{active_model}' not found for agent.")
+    if not bool(model_entry.get("shared", False)):
+        raise HTTPException(status_code=403, detail="Requested model is not shared by its owner.")
+    weights = _sanitize_weights(model_entry.get("weights"))
+    if weights is None:
+        raise HTTPException(status_code=500, detail="Shared model weights are unavailable.")
+    return weights, active_model, _normalize_external_name(model_entry.get("external_name"))
+
+
 def _save_agent_weights(
     agent_name: str,
     agent_token: str,
@@ -822,9 +1093,16 @@ def _save_agent_weights(
         existing["agent_token"] = cleaned_token
         existing["default_model"] = str(existing.get("default_model") or _DEFAULT_MODEL_NAME)
         existing.setdefault("models", {})
+        prior_model = existing["models"].get(active_model)
         existing["models"][active_model] = {
             "weights": sanitized,
             "updated_at": datetime.now(timezone.utc).isoformat(),
+            "shared": bool(prior_model.get("shared", False)) if isinstance(prior_model, dict) else False,
+            "external_name": (
+                _normalize_external_name(prior_model.get("external_name"))
+                if isinstance(prior_model, dict)
+                else None
+            ),
         }
         agents[cleaned_name] = existing
         _save_weights_agents(agents)
@@ -1030,6 +1308,21 @@ def _build_batch_recommendation_response(
         "errors": error_count,
         "results": results,
     }
+
+
+def _annotate_shared_response(
+    response: dict,
+    owner_agent_name: str,
+    caller_agent_name: str,
+    model_name: str,
+    external_name: Optional[str],
+) -> dict:
+    annotated = dict(response)
+    annotated["model_owner"] = owner_agent_name
+    annotated["called_by"] = caller_agent_name
+    annotated["model_name"] = model_name
+    annotated["external_name"] = external_name
+    return annotated
 
 
 def _build_scoring_data_response(
