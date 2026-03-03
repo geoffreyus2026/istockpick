@@ -1,5 +1,6 @@
 # Runtime logs
 construction.log
+server.log
 
 # Local persisted runtime data (contains agent tokens and weights)
 backend/data/weights.txt
