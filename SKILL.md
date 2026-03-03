@@ -1,6 +1,6 @@
 ---
 name: stock-analyst-deploy
-description: Build, validate, and deploy the iStockPick API from the backend/ directory, including recommendation/scoring-data endpoints, verbose mode, and server runtime wiring.
+description: Build, validate, and deploy the iStockPick API from the backend/ directory, including recommendation/scoring-data endpoints, shared-model APIs, verbose mode, and server runtime wiring.
 ---
 
 # Stock Analyst Deploy Skill
@@ -13,15 +13,17 @@ For production domain (`api.istockpick.ai`), ensure these are live:
 
 1. `GET /health`
 2. `POST /api/v1/agents/register`
-3. `GET|POST /api/v1/recommendation` (supports `asset_type`: stock, crypto, option, future)
-4. `GET|POST /api/v1/scoring-data` (supports `asset_type`)
-5. `GET /api/v1/weights`
-6. `GET /api/v1/model-leaderboard`
-7. `GET|POST /api/v1/portfolio`
-8. `GET /api/v1/congress/trades` (params: `year`, `chamber`, `symbol`, `politician`)
-9. `GET /api/v1/congress/roi` (params: `year`, `chamber`, `top_n`)
-10. `GET /api/v1/congress/seasonal` (params: `year`, `chamber`)
-11. `GET /api/v1/options/chain` (params: `symbol`, `expiry`)
+3. `POST /api/v1/models/share`
+4. `GET|POST /api/v1/shared-models/recommendation`
+5. `GET|POST /api/v1/recommendation` (supports `asset_type`: stock, crypto, option, future)
+6. `GET|POST /api/v1/scoring-data` (supports `asset_type`)
+7. `GET /api/v1/weights`
+8. `GET /api/v1/model-leaderboard`
+9. `GET|POST /api/v1/portfolio`
+10. `GET /api/v1/congress/trades` (params: `year`, `chamber`, `symbol`, `politician`)
+11. `GET /api/v1/congress/roi` (params: `year`, `chamber`, `top_n`)
+12. `GET /api/v1/congress/seasonal` (params: `year`, `chamber`)
+13. `GET /api/v1/options/chain` (params: `symbol`, `expiry`)
 
 ## Recommendation Response Modes
 
@@ -70,6 +72,34 @@ Supports optional weights override:
 5. Default-model behavior:
 - If `model_name` is omitted, updates/read apply to the agent's `default` model.
 - If `model_name` is provided and missing, API returns 404.
+
+## Shared Models
+
+1. `POST /api/v1/models/share`
+- Requires `agent_name` and `agent_token`.
+- Accepts optional `model_name`.
+- Accepts optional `external_name`, which is the public identifier the owner exposes to other developers.
+- `shared=true` publishes the model; `shared=false` unpublishes it.
+
+2. `GET|POST /api/v1/shared-models/recommendation`
+- Requires caller `agent_name` and `agent_token`.
+- Requires `owner_agent_name`.
+- Resolves the shared model by either:
+- `external_name` (preferred public identifier), or
+- `model_name` (owner/internal identifier).
+- Returns shared-model recommendation output plus:
+- `model_owner`
+- `called_by`
+- `model_name`
+- `external_name`
+
+3. Shared model metadata is stored alongside model weights in:
+- `backend/data/weights.txt`
+
+4. `external_name` rules:
+- Optional.
+- Must be unique per owner across that owner's saved models.
+- Persists across future weight updates for the same model.
 
 ## Portfolio Leaderboard
 
@@ -155,7 +185,9 @@ paths = {r.path for r in app.routes}
 required = {
     "/health",
     "/api/v1/agents/register",
+    "/api/v1/models/share",
     "/api/v1/recommendation",
+    "/api/v1/shared-models/recommendation",
     "/api/v1/recommendations",
     "/api/v1/scoring-data",
     "/api/v1/congress/trades",
@@ -241,19 +273,35 @@ curl -X POST "http://api.istockpick.ai/api/v1/portfolio" \
 curl "http://api.istockpick.ai/api/v1/congress/trades?year=2025&chamber=all"
 ```
 
-11. Congress ROI endpoint.
+11. Share model endpoint.
+
+```bash
+curl -X POST "http://api.istockpick.ai/api/v1/models/share" \
+  -H "Content-Type: application/json" \
+  -d '{"agent_name":"agent-alpha","agent_token":"REPLACE_WITH_TOKEN","model_name":"growth","external_name":"agent-alpha-growth","shared":true}'
+```
+
+12. Shared-model recommendation endpoint.
+
+```bash
+curl -X POST "http://api.istockpick.ai/api/v1/shared-models/recommendation" \
+  -H "Content-Type: application/json" \
+  -d '{"stock":"AAPL","agent_name":"agent-beta","agent_token":"REPLACE_WITH_CALLER_TOKEN","owner_agent_name":"agent-alpha","external_name":"agent-alpha-growth","verbose":true}'
+```
+
+13. Congress ROI endpoint.
 
 ```bash
 curl "http://api.istockpick.ai/api/v1/congress/roi?year=2025&chamber=senate&top_n=10"
 ```
 
-12. Congress seasonal endpoint.
+14. Congress seasonal endpoint.
 
 ```bash
 curl "http://api.istockpick.ai/api/v1/congress/seasonal?year=2025"
 ```
 
-13. Options chain endpoint.
+15. Options chain endpoint.
 
 ```bash
 curl "http://api.istockpick.ai/api/v1/options/chain?symbol=AAPL"
