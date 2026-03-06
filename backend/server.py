@@ -106,10 +106,12 @@ for p in (STOCK_ANALYST_PATH, LEGACY_STOCK_ANALYST_PATH):
 
 try:
     from stock_analyst.web_analyzer import generate_full_analysis, generate_scoring_data
+    from stock_analyst.market_data import search_symbol as resolve_symbol_via_openbb
     ANALYSIS_IMPORT_ERROR = None
 except Exception as exc:
     generate_full_analysis = None
     generate_scoring_data = None
+    resolve_symbol_via_openbb = None
     ANALYSIS_IMPORT_ERROR = f"{type(exc).__name__}: {exc}"
     for root in (STOCK_ANALYST_PATH, LEGACY_STOCK_ANALYST_PATH):
         module_path = os.path.join(root, "stock_analyst", "web_analyzer.py")
@@ -177,14 +179,10 @@ def _resolve_symbol_from_input(stock, asset_type="stock"):
         return candidate.upper()
 
     try:
-        import yfinance as yf
-
-        search = yf.Search(query=candidate, max_results=5, news_count=0)
-        quotes = search.quotes or []
-        for quote in quotes:
-            symbol = quote.get("symbol")
-            if symbol and _looks_like_ticker(symbol):
-                return symbol.upper()
+        if resolve_symbol_via_openbb is not None:
+            resolved = resolve_symbol_via_openbb(candidate)
+            if resolved and _looks_like_ticker(resolved):
+                return resolved.upper()
     except Exception:
         return None
 

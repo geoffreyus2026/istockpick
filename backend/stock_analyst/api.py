@@ -9,6 +9,7 @@ from typing import Dict, Optional
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field, ValidationError
 
+from .market_data import search_symbol
 from .web_analyzer import generate_full_analysis, generate_scoring_data, AssetType
 
 _DB_LOCK = threading.Lock()
@@ -285,22 +286,9 @@ def _resolve_symbol(stock: str, asset_type: str = "stock") -> Optional[str]:
         return candidate.upper()
 
     try:
-        import yfinance as yf
-        import concurrent.futures
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(
-                lambda: yf.Search(query=candidate, max_results=5, news_count=0)
-            )
-            try:
-                search = future.result(timeout=5)
-            except concurrent.futures.TimeoutError:
-                return None
-        quotes = search.quotes or []
-        for quote in quotes:
-            symbol = quote.get("symbol")
-            if symbol and _looks_like_ticker(symbol):
-                return symbol.upper()
+        resolved = search_symbol(candidate)
+        if resolved and _looks_like_ticker(resolved):
+            return resolved.upper()
     except Exception:
         return None
 

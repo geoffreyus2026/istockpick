@@ -1,4 +1,3 @@
-import yfinance as yf
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
@@ -6,6 +5,17 @@ from typing import Dict, List, Optional
 import logging
 
 from .config import MARKET_BENCHMARK, RISK_FREE_RATE
+from .market_data import get_price_history
+from .qlib_engine import (
+    bollinger_bands,
+    build_snapshot,
+    macd,
+    moving_average,
+    rsi,
+    support_resistance,
+    volatility_summary,
+    volume_summary,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -22,12 +32,9 @@ class TechnicalAnalyzer:
     def get_price_data(self, symbol: str, period: str = "1y") -> pd.DataFrame:
         """Fetch historical price data"""
         try:
-            ticker = yf.Ticker(symbol)
-            data = ticker.history(period=period)
-            
+            data = get_price_history(symbol, period=period, asset_type="stock")
             if data.empty:
                 raise ValueError(f"No data found for {symbol}")
-            
             return data
         except Exception as e:
             logger.error(f"Error fetching data for {symbol}: {e}")
@@ -37,94 +44,33 @@ class TechnicalAnalyzer:
         """Calculate various moving averages"""
         mas = {}
         for name, period in self.periods.items():
-            mas[f'MA_{period}'] = data['Close'].rolling(window=period).mean().iloc[-1]
+            mas[f'MA_{period}'] = moving_average(data['Close'], period)
         
         return mas
     
     def calculate_rsi(self, data: pd.DataFrame, period: int = 14) -> float:
         """Calculate Relative Strength Index"""
-        delta = data['Close'].diff()
-        gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
-        
-        rs = gain / loss
-        rsi = 100 - (100 / (1 + rs))
-        
-        return rsi.iloc[-1]
+        return rsi(data["Close"], period=period)
     
     def calculate_macd(self, data: pd.DataFrame) -> Dict[str, float]:
         """Calculate MACD indicator"""
-        exp1 = data['Close'].ewm(span=12).mean()
-        exp2 = data['Close'].ewm(span=26).mean()
-        macd = exp1 - exp2
-        signal = macd.ewm(span=9).mean()
-        histogram = macd - signal
-        
-        return {
-            'macd': macd.iloc[-1],
-            'signal': signal.iloc[-1],
-            'histogram': histogram.iloc[-1]
-        }
+        return macd(data["Close"])
     
     def calculate_bollinger_bands(self, data: pd.DataFrame, period: int = 20) -> Dict[str, float]:
         """Calculate Bollinger Bands"""
-        sma = data['Close'].rolling(window=period).mean()
-        std = data['Close'].rolling(window=period).std()
-        
-        upper_band = sma + (std * 2)
-        lower_band = sma - (std * 2)
-        
-        return {
-            'upper_band': upper_band.iloc[-1],
-            'middle_band': sma.iloc[-1],
-            'lower_band': lower_band.iloc[-1],
-            'band_width': (upper_band.iloc[-1] - lower_band.iloc[-1]) / sma.iloc[-1]
-        }
+        return bollinger_bands(data["Close"], period=period)
     
     def calculate_volume_indicators(self, data: pd.DataFrame) -> Dict[str, float]:
         """Calculate volume-based indicators"""
-        volume_sma = data['Volume'].rolling(window=20).mean()
-        current_volume = data['Volume'].iloc[-1]
-        
-        on_balance_volume = (data['Close'].diff() > 0).astype(int) * data['Volume']
-        obv = on_balance_volume.cumsum()
-        
-        return {
-            'volume_ratio': current_volume / volume_sma.iloc[-1],
-            'obv_trend': obv.iloc[-1] - obv.iloc[-20],
-            'volume_sma': volume_sma.iloc[-1]
-        }
+        return volume_summary(data)
     
     def calculate_support_resistance(self, data: pd.DataFrame, window: int = 20) -> Dict[str, float]:
         """Identify support and resistance levels"""
-        highs = data['High'].rolling(window=window, center=True).max()
-        lows = data['Low'].rolling(window=window, center=True).min()
-        
-        resistance = highs.max()
-        support = lows.min()
-        
-        return {
-            'support': support,
-            'resistance': resistance,
-            'current_price': data['Close'].iloc[-1],
-            'distance_to_support': (data['Close'].iloc[-1] - support) / support,
-            'distance_to_resistance': (resistance - data['Close'].iloc[-1]) / resistance
-        }
+        return support_resistance(data, window=window)
     
     def calculate_volatility(self, data: pd.DataFrame, period: int = 20) -> Dict[str, float]:
         """Calculate volatility metrics"""
-        returns = data['Close'].pct_change()
-        
-        historical_vol = returns.rolling(window=period).std() * np.sqrt(252)
-        current_vol = historical_vol.iloc[-1]
-        
-        atr = self._calculate_atr(data, period)
-        
-        return {
-            'historical_volatility': current_vol,
-            'atr': atr.iloc[-1],
-            'volatility_percentile': (historical_vol <= current_vol).mean()
-        }
+        return volatility_summary(data, period=period)
     
     def _calculate_atr(self, data: pd.DataFrame, period: int = 14) -> pd.Series:
         """Calculate Average True Range"""

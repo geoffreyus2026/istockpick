@@ -6,10 +6,12 @@ requires-python = ">=3.10"
 dependencies = [
     "fastapi",
     "uvicorn",
-    "yfinance",
     "pydantic",
     "python-dotenv",
     "pandas",
     "numpy",
     "capitolgains",
+    "openbb",
+    "pyqlib",
+    "yfinance",
 ]

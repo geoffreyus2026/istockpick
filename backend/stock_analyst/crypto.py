@@ -1,9 +1,12 @@
-"""Crypto snapshot and scoring -- uses yfinance with SYMBOL-USD tickers."""
+"""Crypto snapshot and scoring backed by OpenBB history adapters."""
 
 import logging
 import re
 from datetime import datetime, timezone
 from typing import Optional
+
+from .market_data import get_company_profile, get_price_history
+from .qlib_engine import build_snapshot
 
 logger = logging.getLogger(__name__)
 
@@ -51,55 +54,17 @@ def normalize_crypto_symbol(symbol: str) -> str:
 
 
 def get_crypto_snapshot(symbol: str) -> dict:
-    """Fetch crypto price data via yfinance."""
-    import yfinance as yf
-
+    """Fetch crypto price data via OpenBB with yfinance fallback."""
     yf_symbol = normalize_crypto_symbol(symbol)
-    ticker = yf.Ticker(yf_symbol)
-    hist = ticker.history(period="1y", interval="1d", auto_adjust=False)
+    hist = get_price_history(yf_symbol, period="1y", asset_type="crypto")
     if hist is None or hist.empty:
         raise ValueError(f"No historical data for {yf_symbol}")
 
-    closes = [float(v) for v in hist["Close"].dropna().tolist()]
-    volumes = [float(v) for v in hist["Volume"].fillna(0).tolist()]
-    if not closes:
-        raise ValueError(f"No close data for {yf_symbol}")
-
-    price = closes[-1]
-    prev_close = closes[-2] if len(closes) > 1 else price
-    change_pct = ((price - prev_close) / prev_close * 100) if prev_close else 0
-    ma50 = sum(closes[-50:]) / min(len(closes), 50)
-    ma200 = sum(closes[-200:]) / min(len(closes), 200)
-    avg_vol_20 = sum(volumes[-20:]) / min(len(volumes), 20) if volumes else 0
-    current_vol = volumes[-1] if volumes else 0
-
-    trend = "NEUTRAL"
-    if change_pct > 3:
-        trend = "BULLISH"
-    elif change_pct < -3:
-        trend = "BEARISH"
-
-    open_price = float(hist["Open"].dropna().iloc[-1]) if not hist["Open"].dropna().empty else price
-    high_price = float(hist["High"].dropna().iloc[-1]) if not hist["High"].dropna().empty else price
-    low_price = float(hist["Low"].dropna().iloc[-1]) if not hist["Low"].dropna().empty else price
-
     base_symbol = yf_symbol.replace("-USD", "") if "-USD" in yf_symbol else yf_symbol
-
-    return {
-        "symbol": yf_symbol,
-        "name": base_symbol,
-        "asset_type": "crypto",
-        "price": price,
-        "change_pct": change_pct,
-        "volume_ratio": (current_vol / avg_vol_20) if avg_vol_20 else 1,
-        "trend": trend,
-        "fifty_day_avg": ma50,
-        "two_hundred_day_avg": ma200,
-        "open": open_price,
-        "high": high_price,
-        "low": low_price,
-        "volume": current_vol,
-    }
+    profile = get_company_profile(yf_symbol)
+    snapshot = build_snapshot(hist, yf_symbol, asset_type="crypto", name=profile.get("name") or base_symbol)
+    snapshot["name"] = snapshot.get("name") or base_symbol
+    return snapshot
 
 
 def get_crypto_sentiment(snapshot: dict, weights: Optional[dict] = None) -> dict:

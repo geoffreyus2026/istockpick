@@ -24,8 +24,8 @@ AI-powered stock analysis platform that delivers BUY / SELL / HOLD recommendatio
 
 ## Features
 
-- **Technical Analysis** — RSI, MACD, Bollinger Bands, moving-average crossovers, volume ratios
-- **Fundamental Analysis** — P/E, PEG, ROE, debt ratios, revenue & earnings growth
+- **Technical Analysis** — Qlib-oriented factor engine for RSI, MACD, Bollinger Bands, moving-average crossovers, and volume ratios
+- **Fundamental Analysis** — OpenBB-backed company metrics, ratios, statements, and profile data
 - **Sentiment Analysis** — X/Twitter, Reddit (r/wallstreetbets, r/stocks, …), and RSS news feeds (WSJ, CNBC, Reuters, Financial Times)
 - **AI Sentiment Scoring** — OpenAI GPT-4o-mini evaluates aggregated sentiment
 - **Multi-Asset Support** — Stocks, Crypto (`BTC-USD`), Options (chain + put/call analysis), and Futures (`ES=F`)
@@ -55,14 +55,16 @@ AI-powered stock analysis platform that delivers BUY / SELL / HOLD recommendatio
 │    crypto.py                       │  Crypto snapshot & scoring
 │    futures.py                      │  Futures snapshot & scoring
 │    options.py                      │  Options chain, snapshot & scoring
-│    technical.py                    │  Technical indicators
-│    fundamental.py                  │  Fundamental metrics
+│    technical.py                    │  Technical indicators via Qlib feature engine
+│    fundamental.py                  │  Fundamental metrics via OpenBB
+│    market_data.py                  │  OpenBB market/fundamental/options adapter
+│    qlib_engine.py                  │  Qlib feature wrapper + compatibility fallback
 │    config.py                       │  Environment & constants
 └──────────────┬─────────────────────┘
                │
-   ┌───────────┼───────────┐
-   ▼           ▼           ▼
- yfinance   Alpaca API   Stooq        ← Market data (multi-provider fallback)
+   ┌────────────┬───────────────┐
+   ▼            ▼               ▼
+ OpenBB      Qlib factors   yfinance fallback   ← Market/factor data
                │
    ┌───────────┼───────────┐
    ▼           ▼           ▼
@@ -83,7 +85,7 @@ Data is persisted in flat JSON files under `backend/data/`.
 | API Framework | FastAPI + Uvicorn |
 | Web Server | Python `http.server` (`backend/server.py`) |
 | Frontend | Static HTML / CSS / JS (deployed via GitHub Pages) |
-| Market Data | yfinance, Alpaca Markets API, Stooq |
+| Market Data | OpenBB (primary), Qlib feature engine, yfinance compatibility fallback |
 | Sentiment | X/Twitter API v2, Reddit API, RSS feeds |
 | AI Scoring | OpenAI API (GPT-4o-mini) |
 | Congressional Trades | Senate EFTS public JSON API, House Clerk annual PTR ZIP |
@@ -110,8 +112,10 @@ istockpick/
 │   │   ├── crypto.py                # Crypto snapshot & scoring
 │   │   ├── futures.py               # Futures snapshot & scoring
 │   │   ├── options.py               # Options chain, snapshot & scoring
-│   │   ├── fundamental.py           # Fundamental analysis
-│   │   ├── technical.py             # Technical indicators
+│   │   ├── fundamental.py           # Fundamental analysis via OpenBB
+│   │   ├── market_data.py           # Shared OpenBB/yfinance adapters
+│   │   ├── qlib_engine.py           # Qlib feature computations + fallback
+│   │   ├── technical.py             # Technical indicators via Qlib engine
 │   │   └── web_analyzer.py          # Analysis orchestrator
 │   ├── scripts/
 │   │   ├── process_tweets_fixed.py
@@ -139,7 +143,7 @@ istockpick/
 
 - Python 3.10+
 - [uv](https://docs.astral.sh/uv/) (recommended) or pip
-- (Optional) Alpaca, Twitter/X, and OpenAI API keys for full functionality
+- (Optional) OpenBB-compatible provider credentials, Qlib data directory, Twitter/X, and OpenAI API keys for full functionality
 
 ### Installation
 
@@ -195,10 +199,17 @@ uv run uvicorn stock_analyst.api:app --host 0.0.0.0 --port 8000
 Create a `.env` file in the project root (or set environment variables directly):
 
 ```dotenv
-# Alpaca Market Data (optional — falls back to yfinance/Stooq)
-APCA_API_KEY_ID=...
-APCA_API_SECRET_KEY=...
-ALPACA_DATA_BASE_URL=https://data.alpaca.markets
+# OpenBB providers
+OPENBB_PRICE_PROVIDER=yfinance
+OPENBB_QUOTE_PROVIDER=yfinance
+OPENBB_SEARCH_PROVIDER=nasdaq
+OPENBB_FUNDAMENTAL_PROVIDER=fmp
+OPENBB_PROFILE_PROVIDER=fmp
+OPENBB_OPTIONS_PROVIDER=yfinance
+
+# Qlib research runtime (optional)
+QLIB_PROVIDER_URI=~/.qlib/qlib_data/us_data
+QLIB_REGION=us
 
 # Twitter / X Sentiment
 TWITTER_BEARER_TOKEN=...
@@ -217,7 +228,7 @@ PORT=8001                               # default server port
 FRONTEND_DIR=...                        # override frontend path
 ```
 
-Alpaca credentials can also be placed in `~/.configuration/alpaca/credentials.json`.
+If `openbb` or `pyqlib` are not installed or configured yet, the backend falls back to the compatibility adapter in [`backend/stock_analyst/market_data.py`](/Users/richliu/projects/private/istockpick/backend/stock_analyst/market_data.py), which still uses `yfinance` under the hood so existing endpoints keep running during migration.
 
 ---
 

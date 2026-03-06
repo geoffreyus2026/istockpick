@@ -1,8 +1,13 @@
-"""Options chain, snapshot, and scoring -- uses yfinance option_chain()."""
+"""Options chain, snapshot, and scoring backed by OpenBB option chains."""
 
 import logging
 from datetime import datetime, timezone
 from typing import Optional
+
+import pandas as pd
+
+from .market_data import get_options_chain_dataset, get_price_history
+from .qlib_engine import build_snapshot
 
 logger = logging.getLogger(__name__)
 
@@ -28,52 +33,71 @@ OPTIONS_WEIGHT_DEFAULTS = {
 }
 
 
+def _row_value(row: pd.Series, *keys, default=0):
+    lowered = {str(k).strip().lower(): v for k, v in row.to_dict().items()}
+    for key in keys:
+        if key.lower() in lowered and lowered[key.lower()] is not None:
+            return lowered[key.lower()]
+    return default
+
+
 def get_options_chain(symbol: str, expiry: Optional[str] = None) -> dict:
     """Fetch options chain for a symbol. If expiry is None, use the nearest
     available expiration date."""
-    import yfinance as yf
-
     symbol = (symbol or "").strip().upper()
-    ticker = yf.Ticker(symbol)
-
-    expirations = ticker.options
-    if not expirations:
+    dataset = get_options_chain_dataset(symbol, expiry=expiry)
+    raw = dataset.get("raw")
+    if not isinstance(raw, pd.DataFrame) or raw.empty:
         raise ValueError(f"No options available for {symbol}")
 
-    target_expiry = expiry
-    if not target_expiry:
-        target_expiry = expirations[0]
-    elif target_expiry not in expirations:
-        raise ValueError(f"Expiry {target_expiry} not available. Options: {list(expirations[:10])}")
+    lower_cols = {str(col).lower(): col for col in raw.columns}
+    expiry_col = lower_cols.get("expiration") or lower_cols.get("expiry")
+    option_type_col = lower_cols.get("optiontype") or lower_cols.get("option_type") or lower_cols.get("side")
 
-    chain = ticker.option_chain(target_expiry)
+    available_expiries = []
+    if expiry_col is not None:
+        values = raw[expiry_col].dropna().astype(str).tolist()
+        available_expiries = sorted(dict.fromkeys(values))[:20]
+
+    target_expiry = expiry or dataset.get("expiry") or (available_expiries[0] if available_expiries else None)
+    filtered = raw
+    if expiry_col is not None and target_expiry:
+        filtered = raw[raw[expiry_col].astype(str) == target_expiry].copy()
+    if filtered.empty:
+        filtered = raw.copy()
 
     calls_data = []
-    if chain.calls is not None and not chain.calls.empty:
-        for _, row in chain.calls.iterrows():
+    calls_df = filtered
+    if option_type_col is not None:
+        calls_df = filtered[filtered[option_type_col].astype(str).str.lower().str.startswith("c")]
+    if not calls_df.empty:
+        for _, row in calls_df.iterrows():
             calls_data.append({
-                "strike": float(row.get("strike", 0)),
-                "lastPrice": float(row.get("lastPrice", 0)),
-                "bid": float(row.get("bid", 0)),
-                "ask": float(row.get("ask", 0)),
-                "volume": int(row.get("volume", 0)) if row.get("volume") and str(row.get("volume")) != "nan" else 0,
-                "openInterest": int(row.get("openInterest", 0)) if row.get("openInterest") and str(row.get("openInterest")) != "nan" else 0,
-                "impliedVolatility": float(row.get("impliedVolatility", 0)),
-                "inTheMoney": bool(row.get("inTheMoney", False)),
+                "strike": float(_row_value(row, "strike")),
+                "lastPrice": float(_row_value(row, "lastPrice", "last_price", "mark", default=0)),
+                "bid": float(_row_value(row, "bid", default=0)),
+                "ask": float(_row_value(row, "ask", default=0)),
+                "volume": int(_row_value(row, "volume", default=0)) if str(_row_value(row, "volume", default=0)) != "nan" else 0,
+                "openInterest": int(_row_value(row, "openInterest", "open_interest", "openInterestVolume", default=0)) if str(_row_value(row, "openInterest", "open_interest", "openInterestVolume", default=0)) != "nan" else 0,
+                "impliedVolatility": float(_row_value(row, "impliedVolatility", "implied_volatility", "iv", default=0)),
+                "inTheMoney": bool(_row_value(row, "inTheMoney", "in_the_money", default=False)),
             })
 
     puts_data = []
-    if chain.puts is not None and not chain.puts.empty:
-        for _, row in chain.puts.iterrows():
+    puts_df = filtered
+    if option_type_col is not None:
+        puts_df = filtered[filtered[option_type_col].astype(str).str.lower().str.startswith("p")]
+    if not puts_df.empty:
+        for _, row in puts_df.iterrows():
             puts_data.append({
-                "strike": float(row.get("strike", 0)),
-                "lastPrice": float(row.get("lastPrice", 0)),
-                "bid": float(row.get("bid", 0)),
-                "ask": float(row.get("ask", 0)),
-                "volume": int(row.get("volume", 0)) if row.get("volume") and str(row.get("volume")) != "nan" else 0,
-                "openInterest": int(row.get("openInterest", 0)) if row.get("openInterest") and str(row.get("openInterest")) != "nan" else 0,
-                "impliedVolatility": float(row.get("impliedVolatility", 0)),
-                "inTheMoney": bool(row.get("inTheMoney", False)),
+                "strike": float(_row_value(row, "strike")),
+                "lastPrice": float(_row_value(row, "lastPrice", "last_price", "mark", default=0)),
+                "bid": float(_row_value(row, "bid", default=0)),
+                "ask": float(_row_value(row, "ask", default=0)),
+                "volume": int(_row_value(row, "volume", default=0)) if str(_row_value(row, "volume", default=0)) != "nan" else 0,
+                "openInterest": int(_row_value(row, "openInterest", "open_interest", "openInterestVolume", default=0)) if str(_row_value(row, "openInterest", "open_interest", "openInterestVolume", default=0)) != "nan" else 0,
+                "impliedVolatility": float(_row_value(row, "impliedVolatility", "implied_volatility", "iv", default=0)),
+                "inTheMoney": bool(_row_value(row, "inTheMoney", "in_the_money", default=False)),
             })
 
     total_call_oi = sum(c["openInterest"] for c in calls_data)
@@ -92,7 +116,7 @@ def get_options_chain(symbol: str, expiry: Optional[str] = None) -> dict:
     return {
         "symbol": symbol,
         "expiry": target_expiry,
-        "available_expiries": list(expirations[:20]),
+        "available_expiries": available_expiries,
         "calls_count": len(calls_data),
         "puts_count": len(puts_data),
         "calls": calls_data,
@@ -133,36 +157,10 @@ def _compute_max_pain(calls: list[dict], puts: list[dict]) -> Optional[float]:
 
 def get_options_snapshot(symbol: str) -> dict:
     """Underlying stock snapshot enriched with nearest-expiry options summary."""
-    import yfinance as yf
-
     symbol = (symbol or "").strip().upper()
-    ticker = yf.Ticker(symbol)
-    hist = ticker.history(period="1y", interval="1d", auto_adjust=False)
+    hist = get_price_history(symbol, period="1y", asset_type="stock")
     if hist is None or hist.empty:
         raise ValueError(f"No historical data for {symbol}")
-
-    closes = [float(v) for v in hist["Close"].dropna().tolist()]
-    volumes = [float(v) for v in hist["Volume"].fillna(0).tolist()]
-    if not closes:
-        raise ValueError(f"No close data for {symbol}")
-
-    price = closes[-1]
-    prev_close = closes[-2] if len(closes) > 1 else price
-    change_pct = ((price - prev_close) / prev_close * 100) if prev_close else 0
-    ma50 = sum(closes[-50:]) / min(len(closes), 50)
-    ma200 = sum(closes[-200:]) / min(len(closes), 200)
-    avg_vol_20 = sum(volumes[-20:]) / min(len(volumes), 20) if volumes else 0
-    current_vol = volumes[-1] if volumes else 0
-
-    trend = "NEUTRAL"
-    if change_pct > 2:
-        trend = "BULLISH"
-    elif change_pct < -2:
-        trend = "BEARISH"
-
-    open_price = float(hist["Open"].dropna().iloc[-1]) if not hist["Open"].dropna().empty else price
-    high_price = float(hist["High"].dropna().iloc[-1]) if not hist["High"].dropna().empty else price
-    low_price = float(hist["Low"].dropna().iloc[-1]) if not hist["Low"].dropna().empty else price
 
     # Fetch options summary for nearest expiry
     options_summary = {}
@@ -173,22 +171,9 @@ def get_options_snapshot(symbol: str) -> dict:
     except Exception as exc:
         logger.warning("Options chain fetch failed for %s: %s", symbol, exc)
 
-    return {
-        "symbol": symbol,
-        "name": symbol,
-        "asset_type": "option",
-        "price": price,
-        "change_pct": change_pct,
-        "volume_ratio": (current_vol / avg_vol_20) if avg_vol_20 else 1,
-        "trend": trend,
-        "fifty_day_avg": ma50,
-        "two_hundred_day_avg": ma200,
-        "open": open_price,
-        "high": high_price,
-        "low": low_price,
-        "volume": current_vol,
-        "options_summary": options_summary,
-    }
+    snapshot = build_snapshot(hist, symbol, asset_type="option", name=symbol)
+    snapshot["options_summary"] = options_summary
+    return snapshot
 
 
 def get_options_sentiment(snapshot: dict, weights: Optional[dict] = None) -> dict:

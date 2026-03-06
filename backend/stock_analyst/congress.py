@@ -330,22 +330,16 @@ def _fetch_via_house_ptr(year: int) -> list[dict]:
 
 def compute_trade_roi(trades: list[dict]) -> list[dict]:
     """Enrich trades with ROI by looking up the price at trade date and
-    the current price via yfinance."""
-    try:
-        import yfinance as yf
-    except ImportError:
-        logger.warning("yfinance not available for ROI computation")
-        return trades
+    the current price via the shared market-data adapter."""
+    from .market_data import get_latest_price, get_price_near_date
 
     symbols = {t["symbol"] for t in trades if t.get("symbol")}
     price_cache: dict[str, float] = {}
 
     for symbol in symbols:
         try:
-            ticker = yf.Ticker(symbol)
-            info = ticker.fast_info if hasattr(ticker, "fast_info") else {}
-            current = getattr(info, "last_price", None) or info.get("lastPrice")
-            if current:
+            current = get_latest_price(symbol, asset_type="stock")
+            if current is not None:
                 price_cache[symbol] = float(current)
         except Exception:
             pass
@@ -362,10 +356,7 @@ def compute_trade_roi(trades: list[dict]) -> list[dict]:
         price_at_trade = None
         if symbol and trade_date:
             try:
-                ticker = yf.Ticker(symbol)
-                hist = ticker.history(start=trade_date, period="5d")
-                if hist is not None and not hist.empty:
-                    price_at_trade = float(hist["Close"].iloc[0])
+                price_at_trade = get_price_near_date(symbol, trade_date, asset_type="stock")
             except Exception:
                 pass
 

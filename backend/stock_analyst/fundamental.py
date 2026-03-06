@@ -1,9 +1,10 @@
-import yfinance as yf
 import pandas as pd
 import numpy as np
 from datetime import datetime
 from typing import Dict, List, Optional
 import logging
+
+from .market_data import get_fundamental_dataset
 
 logger = logging.getLogger(__name__)
 
@@ -27,27 +28,20 @@ class FundamentalAnalyzer:
     def get_fundamental_data(self, symbol: str) -> Dict:
         """Fetch comprehensive fundamental data"""
         try:
-            ticker = yf.Ticker(symbol)
-            
-            # Get basic info
-            info = ticker.info
-            
-            # Get financial statements
-            financials = ticker.financials
-            balance_sheet = ticker.balance_sheet
-            cash_flow = ticker.cashflow
-            
-            # Get earnings data
-            earnings = ticker.earnings
-            quarterly_earnings = ticker.quarterly_earnings
-            
+            dataset = get_fundamental_dataset(symbol)
+            info = {}
+            info.update(dataset.get("profile") or {})
+            for frame_name in ("metrics", "ratios"):
+                frame = dataset.get(frame_name)
+                if isinstance(frame, pd.DataFrame) and not frame.empty:
+                    info.update({str(k): v for k, v in frame.iloc[0].to_dict().items()})
             return {
                 'info': info,
-                'financials': financials,
-                'balance_sheet': balance_sheet,
-                'cash_flow': cash_flow,
-                'earnings': earnings,
-                'quarterly_earnings': quarterly_earnings
+                'financials': dataset.get('income_statement', pd.DataFrame()),
+                'balance_sheet': dataset.get('balance_sheet', pd.DataFrame()),
+                'cash_flow': dataset.get('cash_flow', pd.DataFrame()),
+                'earnings': dataset.get('earnings', pd.DataFrame()),
+                'quarterly_earnings': dataset.get('quarterly_earnings', pd.DataFrame()),
             }
         except Exception as e:
             logger.error(f"Error fetching fundamental data for {symbol}: {e}")

@@ -12,6 +12,9 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Optional
 
+from .market_data import get_company_profile, get_price_history
+from .qlib_engine import build_snapshot
+
 _SYMBOL_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9\.\-]{0,9}$")
 _MULTI_ASSET_SYMBOL_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9\.\-=]{0,14}$")
 
@@ -1038,40 +1041,22 @@ def _snapshot_from_alpaca(symbol: str) -> dict:
     return _build_snapshot(symbol, closes, volumes, open_price, high_price, low_price)
 
 
-def _snapshot_from_yfinance(symbol: str) -> dict:
-    import yfinance as yf
-
-    ticker = yf.Ticker(symbol)
-    hist = ticker.history(period="1y", interval="1d", auto_adjust=False)
-    if hist is None or hist.empty:
-        raise ValueError(f"No yfinance historical data for {symbol}")
-
-    closes = [float(v) for v in hist["Close"].dropna().tolist()]
-    volumes = [float(v) for v in hist["Volume"].fillna(0).tolist()]
-    open_price = float(hist["Open"].dropna().iloc[-1]) if not hist["Open"].dropna().empty else closes[-1]
-    high_price = float(hist["High"].dropna().iloc[-1]) if not hist["High"].dropna().empty else closes[-1]
-    low_price = float(hist["Low"].dropna().iloc[-1]) if not hist["Low"].dropna().empty else closes[-1]
-
-    return _build_snapshot(symbol, closes, volumes, open_price, high_price, low_price)
-
-
 def get_stock_snapshot(symbol: str) -> dict:
     symbol = (symbol or "").strip().upper()
     if not _SYMBOL_PATTERN.fullmatch(symbol):
         raise ValueError("Invalid symbol format")
 
     try:
-        return _snapshot_from_alpaca(symbol)
-    except Exception as alpaca_exc:
-        logger.warning("alpaca snapshot failed for %s: %s", symbol, alpaca_exc)
-        try:
-            return _snapshot_from_stooq(symbol)
-        except Exception as stooq_exc:
-            logger.warning("stooq snapshot failed for %s: %s", symbol, stooq_exc)
-            try:
-                return _snapshot_from_yfinance(symbol)
-            except Exception as yf_exc:
-                raise ValueError(f"All market data providers failed for {symbol}: {yf_exc}") from yf_exc
+        history = get_price_history(symbol, period="1y", asset_type="stock")
+        profile = get_company_profile(symbol)
+        return build_snapshot(
+            history,
+            symbol,
+            asset_type="stock",
+            name=profile.get("name") or profile.get("company_name") or symbol,
+        )
+    except Exception as exc:
+        raise ValueError(f"Market data providers failed for {symbol}: {exc}") from exc
 
 
 def _resolve_scoring_weights(weights: Optional[dict]) -> dict:
