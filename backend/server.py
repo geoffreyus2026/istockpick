@@ -37,6 +37,11 @@ ANALYSIS_RUNTIME_PYTHON = os.getenv(
     "ANALYSIS_RUNTIME_PYTHON",
     "/tmp/stock-analyst-venv/bin/python3",
 )
+ANALYSIS_RUNTIME_CANDIDATES = (
+    ANALYSIS_RUNTIME_PYTHON,
+    os.path.join(_BACKEND_DIR, ".venv", "bin", "python"),
+    os.path.join(_BACKEND_DIR, ".venv", "bin", "python3"),
+)
 
 SCORING_WEIGHT_DEFAULTS = {
     "base_score": 50.0,
@@ -149,6 +154,13 @@ def _detect_asset_type(symbol: str) -> str:
     if re.fullmatch(r"[A-Z0-9]+-USD", s):
         return "crypto"
     return "stock"
+
+
+def _resolve_analysis_runtime_python() -> str:
+    for candidate in ANALYSIS_RUNTIME_CANDIDATES:
+        if candidate and os.path.isfile(candidate):
+            return candidate
+    return sys.executable
 
 
 def _resolve_symbol_from_input(stock, asset_type="stock"):
@@ -2505,10 +2517,15 @@ class ConstructionHandler(http.server.SimpleHTTPRequestHandler):
                     return
 
             if generate_modeling_payload is None:
-                self.send_json(503, {"error": "Modeling endpoint is unavailable on this runtime."})
-                return
-
-            modeling = generate_modeling_payload(query, asset_type=at)
+                try:
+                    modeling = self.generate_modeling_payload_subprocess(query, asset_type=at)
+                except Exception:
+                    self.send_json(500, {
+                        "error": "Modeling engine is temporarily unavailable.",
+                    })
+                    return
+            else:
+                modeling = generate_modeling_payload(query, asset_type=at)
             if public_stock:
                 modeling["company"] = public_stock.get("name", modeling.get("company", query))
             self.send_json(200, modeling)
@@ -2525,9 +2542,7 @@ class ConstructionHandler(http.server.SimpleHTTPRequestHandler):
             "result = web_analyzer.generate_full_analysis(sys.argv[1])\n"
             "print(json.dumps(result))\n"
         )
-        runtime_python = ANALYSIS_RUNTIME_PYTHON
-        if not os.path.isfile(runtime_python):
-            runtime_python = sys.executable
+        runtime_python = _resolve_analysis_runtime_python()
         result = subprocess.run(
             [runtime_python, "-c", script, symbol],
             capture_output=True,
@@ -2541,6 +2556,35 @@ class ConstructionHandler(http.server.SimpleHTTPRequestHandler):
         stdout = (result.stdout or "").strip()
         if not stdout:
             raise RuntimeError("analysis subprocess returned empty output")
+        return json.loads(stdout.splitlines()[-1])
+
+    def generate_modeling_payload_subprocess(self, symbol, asset_type="stock"):
+        script = (
+            "import json, sys\n"
+            f"sys.path.insert(0, {STOCK_ANALYST_PATH!r})\n"
+            f"sys.path.insert(0, {LEGACY_STOCK_ANALYST_PATH!r})\n"
+            "from stock_analyst.modeling import generate_modeling_payload\n"
+            "result = generate_modeling_payload(sys.argv[1], asset_type=sys.argv[2])\n"
+            "print(json.dumps(result))\n"
+        )
+        runtime_python = _resolve_analysis_runtime_python()
+        runtime_env = os.environ.copy()
+        runtime_env.setdefault("HOME", "/tmp")
+        runtime_env.setdefault("OPENBB_HOME", "/tmp/openbb_home")
+        result = subprocess.run(
+            [runtime_python, "-c", script, symbol, asset_type],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+            env=runtime_env,
+        )
+        if result.returncode != 0:
+            details = (result.stderr or result.stdout or "").strip()
+            raise RuntimeError(details or "modeling subprocess failed")
+        stdout = (result.stdout or "").strip()
+        if not stdout:
+            raise RuntimeError("modeling subprocess returned empty output")
         return json.loads(stdout.splitlines()[-1])
 
     def lookup_public_stock(self, query, asset_type="stock"):

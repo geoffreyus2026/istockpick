@@ -1,5 +1,9 @@
 import os
-from dotenv import load_dotenv
+try:
+    from dotenv import load_dotenv
+except Exception:
+    def load_dotenv():
+        return False
 
 # Load environment variables
 load_dotenv()

@@ -1,5 +1,6 @@
 import logging
 import os
+import tempfile
 from datetime import date, datetime, timedelta
 from typing import Any, Optional
 
@@ -11,6 +12,23 @@ _OPENBB_CLIENT = None
 _OPENBB_IMPORT_ERROR: Optional[Exception] = None
 
 
+def _configure_openbb_runtime_env():
+    home_dir = os.path.expanduser(os.getenv("HOME", "~"))
+    if not os.access(home_dir, os.W_OK):
+        temp_home = os.path.join(tempfile.gettempdir(), "openbb_home")
+        os.environ.setdefault("HOME", temp_home)
+    os.environ.setdefault("OPENBB_HOME", os.path.join(os.environ["HOME"], ".openbb_platform"))
+
+
+def _is_openbb_runtime_failure(exc: Exception) -> bool:
+    message = str(exc)
+    return (
+        isinstance(exc, (ImportError, PermissionError, AttributeError))
+        or "OBBject_EquityInfo" in message
+        or ".openbb_platform" in message
+    )
+
+
 def _get_openbb_client():
     global _OPENBB_CLIENT, _OPENBB_IMPORT_ERROR
     if _OPENBB_CLIENT is not None:
@@ -18,6 +36,7 @@ def _get_openbb_client():
     if _OPENBB_IMPORT_ERROR is not None:
         raise _OPENBB_IMPORT_ERROR
     try:
+        _configure_openbb_runtime_env()
         from openbb import obb  # type: ignore
 
         _OPENBB_CLIENT = obb
@@ -107,99 +126,135 @@ def _openbb_call(path: tuple[str, ...], **kwargs):
 
 
 def _history_from_openbb(symbol: str, period: str = "1y", asset_type: str = "stock") -> pd.DataFrame:
-    provider = os.getenv("OPENBB_PRICE_PROVIDER", "yfinance").strip() or "yfinance"
-    start_date = _history_start(period)
-    kwargs = {
-        "symbol": symbol,
-        "start_date": start_date.isoformat(),
-        "provider": provider,
-    }
-    payload = _openbb_call(_openbb_historical_path(asset_type), **kwargs)
-    df = _to_df(payload)
-    normalized = _normalize_history_df(df)
-    if normalized.empty:
-        raise ValueError(f"OpenBB returned no historical data for {symbol}")
-    return normalized
+    try:
+        provider = os.getenv("OPENBB_PRICE_PROVIDER", "yfinance").strip() or "yfinance"
+        start_date = _history_start(period)
+        kwargs = {
+            "symbol": symbol,
+            "start_date": start_date.isoformat(),
+            "provider": provider,
+        }
+        payload = _openbb_call(_openbb_historical_path(asset_type), **kwargs)
+        df = _to_df(payload)
+        normalized = _normalize_history_df(df)
+        if normalized.empty:
+            raise ValueError(f"OpenBB returned no historical data for {symbol}")
+        return normalized
+    except Exception as exc:
+        if not _is_openbb_runtime_failure(exc):
+            raise
+        logger.warning("OpenBB historical fetch is unavailable for %s (%s): %s", symbol, asset_type, exc)
+        return _history_from_yfinance(symbol, period=period)
 
 
 def _quote_from_openbb(symbol: str) -> dict:
-    provider = os.getenv("OPENBB_QUOTE_PROVIDER", "yfinance").strip() or "yfinance"
-    payload = _openbb_call(("equity", "price", "quote"), symbol=symbol, provider=provider)
-    df = _to_df(payload)
-    if df.empty:
-        raise ValueError(f"OpenBB returned no quote data for {symbol}")
-    row = df.iloc[0].to_dict()
-    return {str(k): v for k, v in row.items()}
+    try:
+        provider = os.getenv("OPENBB_QUOTE_PROVIDER", "yfinance").strip() or "yfinance"
+        payload = _openbb_call(("equity", "price", "quote"), symbol=symbol, provider=provider)
+        df = _to_df(payload)
+        if df.empty:
+            raise ValueError(f"OpenBB returned no quote data for {symbol}")
+        row = df.iloc[0].to_dict()
+        return {str(k): v for k, v in row.items()}
+    except Exception as exc:
+        if not _is_openbb_runtime_failure(exc):
+            raise
+        logger.warning("OpenBB quote fetch is unavailable for %s: %s", symbol, exc)
+        return _quote_from_yfinance(symbol)
 
 
 def _search_from_openbb(query: str) -> Optional[str]:
-    provider = os.getenv("OPENBB_SEARCH_PROVIDER", "nasdaq").strip() or "nasdaq"
-    payload = _openbb_call(("equity", "search"), query=query, provider=provider)
-    df = _to_df(payload)
-    if df.empty:
+    try:
+        provider = os.getenv("OPENBB_SEARCH_PROVIDER", "nasdaq").strip() or "nasdaq"
+        payload = _openbb_call(("equity", "search"), query=query, provider=provider)
+        df = _to_df(payload)
+        if df.empty:
+            return None
+        symbol_col = next((col for col in df.columns if str(col).lower() in {"symbol", "ticker"}), None)
+        if symbol_col is None:
+            return None
+        for value in df[symbol_col].tolist():
+            candidate = str(value or "").strip().upper()
+            if candidate:
+                return candidate
         return None
-    symbol_col = next((col for col in df.columns if str(col).lower() in {"symbol", "ticker"}), None)
-    if symbol_col is None:
-        return None
-    for value in df[symbol_col].tolist():
-        candidate = str(value or "").strip().upper()
-        if candidate:
-            return candidate
-    return None
+    except Exception as exc:
+        if not _is_openbb_runtime_failure(exc):
+            raise
+        logger.warning("OpenBB symbol search is unavailable for %s: %s", query, exc)
+        return _search_from_yfinance(query)
 
 
 def _profile_from_openbb(symbol: str) -> dict:
-    provider = os.getenv("OPENBB_PROFILE_PROVIDER", "fmp").strip() or "fmp"
-    payload = _openbb_call(("equity", "profile"), symbol=symbol, provider=provider)
-    df = _to_df(payload)
-    if df.empty:
-        return {}
-    return {str(k): v for k, v in df.iloc[0].to_dict().items()}
+    try:
+        provider = os.getenv("OPENBB_PROFILE_PROVIDER", "fmp").strip() or "fmp"
+        payload = _openbb_call(("equity", "profile"), symbol=symbol, provider=provider)
+        df = _to_df(payload)
+        if df.empty:
+            return {}
+        return {str(k): v for k, v in df.iloc[0].to_dict().items()}
+    except Exception as exc:
+        if not _is_openbb_runtime_failure(exc):
+            raise
+        logger.warning("OpenBB profile fetch is unavailable for %s: %s", symbol, exc)
+        return _fundamentals_from_yfinance(symbol).get("profile", {})
 
 
 def _fundamentals_from_openbb(symbol: str) -> dict:
-    metrics_provider = os.getenv("OPENBB_FUNDAMENTAL_PROVIDER", "fmp").strip() or "fmp"
-    profile = _profile_from_openbb(symbol)
-    metrics_df = _to_df(
-        _openbb_call(("equity", "fundamental", "metrics"), symbol=symbol, provider=metrics_provider)
-    )
-    ratios_df = _to_df(
-        _openbb_call(("equity", "fundamental", "ratios"), symbol=symbol, provider=metrics_provider)
-    )
-    income_df = _to_df(
-        _openbb_call(("equity", "fundamental", "income"), symbol=symbol, provider=metrics_provider)
-    )
-    balance_df = _to_df(
-        _openbb_call(("equity", "fundamental", "balance"), symbol=symbol, provider=metrics_provider)
-    )
-    cash_df = _to_df(
-        _openbb_call(("equity", "fundamental", "cash"), symbol=symbol, provider=metrics_provider)
-    )
-    return {
-        "profile": profile,
-        "metrics": metrics_df,
-        "ratios": ratios_df,
-        "income_statement": income_df,
-        "balance_sheet": balance_df,
-        "cash_flow": cash_df,
-    }
+    try:
+        metrics_provider = os.getenv("OPENBB_FUNDAMENTAL_PROVIDER", "fmp").strip() or "fmp"
+        profile = _profile_from_openbb(symbol)
+        metrics_df = _to_df(
+            _openbb_call(("equity", "fundamental", "metrics"), symbol=symbol, provider=metrics_provider)
+        )
+        ratios_df = _to_df(
+            _openbb_call(("equity", "fundamental", "ratios"), symbol=symbol, provider=metrics_provider)
+        )
+        income_df = _to_df(
+            _openbb_call(("equity", "fundamental", "income"), symbol=symbol, provider=metrics_provider)
+        )
+        balance_df = _to_df(
+            _openbb_call(("equity", "fundamental", "balance"), symbol=symbol, provider=metrics_provider)
+        )
+        cash_df = _to_df(
+            _openbb_call(("equity", "fundamental", "cash"), symbol=symbol, provider=metrics_provider)
+        )
+        return {
+            "profile": profile,
+            "metrics": metrics_df,
+            "ratios": ratios_df,
+            "income_statement": income_df,
+            "balance_sheet": balance_df,
+            "cash_flow": cash_df,
+        }
+    except Exception as exc:
+        if not _is_openbb_runtime_failure(exc):
+            raise
+        logger.warning("OpenBB fundamentals fetch is unavailable for %s: %s", symbol, exc)
+        return _fundamentals_from_yfinance(symbol)
 
 
 def _options_chain_from_openbb(symbol: str, expiry: Optional[str] = None) -> dict:
-    provider = os.getenv("OPENBB_OPTIONS_PROVIDER", "yfinance").strip() or "yfinance"
-    kwargs = {"symbol": symbol, "provider": provider}
-    if expiry:
-        kwargs["expiration"] = expiry
-    payload = _openbb_call(("derivatives", "options", "chains"), **kwargs)
-    df = _to_df(payload)
-    if df.empty:
-        raise ValueError(f"OpenBB returned no options chain for {symbol}")
-    normalized = df.copy()
-    normalized.columns = [str(col).strip() for col in normalized.columns]
-    return {
-        "rows": normalized.to_dict(orient="records"),
-        "raw": normalized,
-    }
+    try:
+        provider = os.getenv("OPENBB_OPTIONS_PROVIDER", "yfinance").strip() or "yfinance"
+        kwargs = {"symbol": symbol, "provider": provider}
+        if expiry:
+            kwargs["expiration"] = expiry
+        payload = _openbb_call(("derivatives", "options", "chains"), **kwargs)
+        df = _to_df(payload)
+        if df.empty:
+            raise ValueError(f"OpenBB returned no options chain for {symbol}")
+        normalized = df.copy()
+        normalized.columns = [str(col).strip() for col in normalized.columns]
+        return {
+            "rows": normalized.to_dict(orient="records"),
+            "raw": normalized,
+        }
+    except Exception as exc:
+        if not _is_openbb_runtime_failure(exc):
+            raise
+        logger.warning("OpenBB options chain fetch is unavailable for %s: %s", symbol, exc)
+        return _options_chain_from_yfinance(symbol, expiry=expiry)
 
 
 def _history_from_yfinance(symbol: str, period: str = "1y") -> pd.DataFrame:
